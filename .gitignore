@@ -47,3 +47,4 @@ logs/
 # OS garbage
 .DS_Store
 Thumbs.db
+application-local.properties

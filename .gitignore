@@ -33,7 +33,6 @@ build/
 .vscode/
 
 # Secrets — never commit
-src/main/resources/application.properties
 .env
 
 # AWS credentials

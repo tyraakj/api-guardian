@@ -1,4 +1,4 @@
-package com.apiguardian.api_guardian.model;
+package com.apiguardian.model;
 
 import lombok.AllArgsConstructor;
 import lombok.Builder;

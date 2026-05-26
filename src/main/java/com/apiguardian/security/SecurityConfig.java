@@ -1,4 +1,4 @@
-package com.apiguardian.api_guardian.security;
+package com.apiguardian.security;
 
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 

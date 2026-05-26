@@ -1,14 +1,7 @@
-
-
 services:
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    command: redis-server --save 60 1 --loglevel warning
-
   kafka:
     image: apache/kafka:3.7.0
+    container_name: api-guardian-kafka
     ports:
       - "9092:9092"
     environment:
@@ -16,10 +9,17 @@ services:
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_LOG_RETENTION_HOURS: 168        # 7 days — events are replayable
-      KAFKA_LOG_FLUSH_INTERVAL_MESSAGES: 1  # flush every message — no data loss
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_FLUSH_INTERVAL_MESSAGES: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+
+  redis:
+    image: redis:7.2
+    container_name: api-guardian-redis
+    ports:
+      - "6379:6379"

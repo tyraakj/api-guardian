@@ -8,7 +8,7 @@
 
 API Guardian sits in front of any HTTP service and adds:
 
-- **Non-blocking reverse proxy** — WebClient forwarding with hard connect + read timeouts
+- **Non-blocking reverse proxy** — WebClient forwarding with bounded connection pool, hard connect + read timeouts
 - **JWT authentication** — signed tokens, 24h expiry, Redis token blacklist for immediate revocation
 - **Rate limiting** — Bucket4j token bucket per client IP backed by Redis
 - **Async event streaming** — every request published to Kafka without blocking the request thread
@@ -53,11 +53,15 @@ Full architecture diagram and layer-by-layer breakdown in `ARCHITECTURE.md`.
 
 ---
 
-## Local Setup
+## Deployment
+
+API Guardian is deployed on **Railway** (gateway + Kafka + Redis) and **Vercel** (React dashboard). Both platforms handle TLS automatically — no Nginx or certificate management needed.
 
 ### Prerequisites
 - Java 17+, Maven, Docker Desktop, Node.js 18+
 - Free [Supabase](https://supabase.com) account
+- Free [Railway](https://railway.app) account
+- Free [Vercel](https://vercel.com) account
 
 ### 1. Clone
 
@@ -66,7 +70,65 @@ git clone https://github.com/yourusername/api-guardian.git
 cd api-guardian
 ```
 
-### 2. Create `src/main/resources/application-local.properties` (gitignored)
+### 2. Create the users table in Supabase
+
+```sql
+CREATE TABLE users (
+  id       UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+  username VARCHAR(255) UNIQUE NOT NULL,
+  password VARCHAR(255) NOT NULL
+);
+```
+
+### 3. Set environment variables in Railway
+
+In your Railway project, set these under the gateway service's variable tab:
+
+```
+JWT_SECRET=your-256-bit-secret-minimum-32-characters
+JWT_EXPIRATION=86400000
+
+SPRING_DATASOURCE_URL=jdbc:postgresql://db.xxxx.supabase.co:5432/postgres
+SPRING_DATASOURCE_USERNAME=postgres
+SPRING_DATASOURCE_PASSWORD=your-supabase-password
+
+AWS_S3_BUCKET=your-bucket-name
+```
+
+No secrets are ever committed to source control.
+
+### 4. Deploy to Railway
+
+Connect your GitHub repo to Railway. It will detect the `docker-compose.yml` and deploy the gateway, Kafka, and Redis as separate services automatically.
+
+```bash
+# Or use the Railway CLI
+railway up
+```
+
+### 5. Deploy dashboard to Vercel
+
+```bash
+cd dashboard
+vercel deploy
+```
+
+Set `VITE_API_URL` in Vercel's environment variables to point at your Railway gateway URL.
+
+### 6. Run locally
+
+```bash
+# Start Kafka + Redis
+docker-compose up -d
+
+# Terminal 1 — gateway
+mvn spring-boot:run
+
+# Terminal 2 — dashboard
+cd dashboard && npm install && npm run dev
+```
+
+For local secrets, create `src/main/resources/application-local.properties` (gitignored):
 
 ```properties
 jwt.secret=your-256-bit-secret-minimum-32-characters
@@ -79,59 +141,30 @@ spring.datasource.password=your-supabase-password
 aws.s3.bucket=your-bucket-name
 ```
 
-### 3. Create the users table in Supabase
+### 7. First login
 
-```sql
-CREATE TABLE users (
-  id       UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-  username VARCHAR(255) UNIQUE NOT NULL,
-  password VARCHAR(255) NOT NULL
-);
-```
-
-Then create your first account via `POST /auth/register` — the app bcrypt-hashes the password for you.
-
-### 4. Start infrastructure
-
-```powershell
-docker-compose up -d
-docker exec api-guardian-redis-1 redis-cli ping   # → PONG
-```
-
-### 5. Run
-
-```powershell
-# Terminal 1 — gateway
-mvn spring-boot:run
-
-# Terminal 2 — dashboard
-cd dashboard; npm install; npm run dev
-```
-
-### 6. First login
-
-```powershell
-# Register your admin account (open only on first run — lock down after)
-curl -X POST http://localhost:8080/auth/register `
-  -H "Content-Type: application/json" `
+```bash
+# Register your admin account (open on first run only)
+curl -X POST http://localhost:8080/auth/register \
+  -H "Content-Type: application/json" \
   -d '{"username":"admin","password":"yourpassword"}'
 
 # Login
-curl -X POST http://localhost:8080/auth/login `
-  -H "Content-Type: application/json" `
+curl -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
   -d '{"username":"admin","password":"yourpassword"}'
 # → {"token":"eyJhbGci..."}
 
 # Invite a developer (requires your token)
-curl -X POST http://localhost:8080/auth/register `
-  -H "Authorization: Bearer eyJhbGci..." `
-  -H "Content-Type: application/json" `
+curl -X POST http://localhost:8080/auth/register \
+  -H "Authorization: Bearer eyJhbGci..." \
+  -H "Content-Type: application/json" \
   -d '{"username":"dev1","password":"theirpassword"}'
 ```
 
-### 7. Health check
+### 8. Health check
 
-```powershell
+```bash
 curl http://localhost:8080/actuator/health   # → {"status":"UP"}
 ```
 

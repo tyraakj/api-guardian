@@ -34,6 +34,8 @@ API Guardian is an event-driven API gateway. The proxy layer emits every request
                         │  ProxyForwarder (WebClient)                 │
                         │    → connectTimeout: 2s                     │
                         │    → readTimeout: 5s → 504 on breach        │
+                        │    → pendingAcquireMaxCount: 500            │
+                        │    → pendingAcquireTimeout: 10s             │
                         └──────────┬───────────────────┬──────────────┘
                                    │                   │
                             Response to          RequestEvent
@@ -44,6 +46,7 @@ API Guardian is an event-driven API gateway. The proxy layer emits every request
                         │  RequestEventProducer                       │
                         │    → kafkaTemplate.send() — no .get()       │
                         │    → error callback only                    │
+                        │    → max.block.ms=5000 (bounded queue)      │
                         │  Topic: api-requests (7 day retention)      │
                         │  RequestEventConsumer                       │
                         │    → Redis SET NX processed:{eventId}       │
@@ -56,13 +59,15 @@ API Guardian is an event-driven API gateway. The proxy layer emits every request
                    │  ANALYTICS API    │    │  SSE STREAM             │
                    │  Redis INCR       │    │  SseEmitter list        │
                    │  counters:        │    │  CopyOnWriteArrayList   │
-                   │  - total reqs     │    │  dead emitters removed  │
-                   │  - per endpoint   │    │  on IOException         │
-                   │  - per status     │    └───────────┬─────────────┘
-                   │  - error rate     │                │
-                   │  - avg latency    │    ┌───────────▼─────────────┐
-                   │  JWT required     │    │  REACT DASHBOARD        │
-                   └───────────────────┘    │  useAnalyticsStream()   │
+                   │  - total reqs     │    │  max 100 connections    │
+                   │  - per endpoint   │    │  dead emitters removed  │
+                   │  - per status     │    │  on IOException +       │
+                   │  - error rate     │    │  periodic cleanup       │
+                   │  - avg latency    │    └───────────┬─────────────┘
+                   │  JWT required     │                │
+                   └───────────────────┘    ┌───────────▼─────────────┐
+                                            │  REACT DASHBOARD        │
+                                            │  useAnalyticsStream()   │
                                             │  EventSource hook       │
                                             │  auto-reconnect         │
                                             └─────────────────────────┘
@@ -87,10 +92,30 @@ External dependencies:
 
 ---
 
+## Deployment
+
+API Guardian is deployed on **Railway** (persistent services, free tier). The React dashboard is deployed separately on **Vercel**. Both platforms handle TLS automatically — no Nginx or certificate management required.
+
+```
+GitHub push → Railway auto-deploy
+               ├── Spring Boot (API Guardian) — Railway service
+               ├── Redis                      — Railway service
+               └── Kafka                      — Railway service
+
+GitHub push → Vercel auto-deploy
+               └── React Dashboard
+```
+
+**HTTPS** is terminated by Railway and Vercel at the edge. JWT tokens in `Authorization` headers are always transmitted over TLS in production. No additional reverse proxy is needed.
+
+**Secrets** are stored as Railway environment variables, not in `application-local.properties`. Spring Boot reads them via `${ENV_VAR_NAME}` in `application.properties`.
+
+---
+
 ## Layer 1 — Infrastructure Scaffold
 
 ### What it does
-Starts Kafka and Redis via Docker. Supabase is remote — no local container needed. All config is split between a committed safe file and a gitignored secrets file.
+Starts Kafka and Redis via Docker locally. In production, both run as Railway services. Supabase is remote — no local container needed. All config is split between a committed safe file and environment variables for secrets.
 
 ### Key decisions
 
@@ -104,15 +129,14 @@ Rate limit buckets (TTL 60s), analytics counters (TTL 24h), event dedup keys (TT
 No container config, no backup setup, no connection pooling to manage ourselves. Standard JDBC URL — Spring Data JPA doesn't know or care it's Supabase. Free tier: 500MB storage, 2 CPUs, sufficient for user accounts.
 
 **HikariCP explicitly configured**
-Spring Boot's default Supabase connection pool is 10. Under load, requests queue waiting for a connection. Set `maximum-pool-size=20`, `minimum-idle=5`, `connection-timeout=30000`. Supabase free tier supports up to 60 direct connections.
+Spring Boot's default connection pool is 10. Under load, requests queue waiting for a connection. Set `maximum-pool-size=20`, `minimum-idle=5`, `connection-timeout=30000`. Supabase free tier supports up to 60 direct connections.
 
 **Config split**
-`application.properties` — committed, safe values only. `application-local.properties` — gitignored, contains JWT secret, Supabase credentials, S3 bucket. Spring merges both at startup via `spring.profiles.active=local`.
+`application.properties` — committed, safe values only. Secrets (JWT secret, Supabase credentials, S3 bucket) are set as environment variables in Railway and read via Spring's `${VAR}` syntax. Never committed to source control.
 
 ### Files
 - `docker-compose.yml`
 - `src/main/resources/application.properties`
-- `src/main/resources/application-local.properties` (gitignored)
 - `ApiGuardianApplication.java`
 
 ---
@@ -127,11 +151,28 @@ Intercepts every non-analytics, non-auth request and forwards it to the configur
 **WebClient over RestTemplate**
 RestTemplate is synchronous — each forwarded request holds a thread from Spring's thread pool until the target responds. Under load (100+ concurrent requests), the thread pool exhausts and new requests queue. WebClient uses non-blocking I/O — the thread is released immediately when the request is sent, and a callback fires when the response arrives. Same result, fraction of the threads.
 
+**WebClient connection pool — explicitly bounded**
+WebClient's default connection pool is unbounded. If the target service is slow and traffic is high, pending connections pile up and eventually exhaust memory. The pool is explicitly configured:
+
+```java
+ConnectionProvider provider = ConnectionProvider.builder("proxy-pool")
+    .maxConnections(500)
+    .pendingAcquireMaxCount(500)
+    .pendingAcquireTimeout(Duration.ofSeconds(10))
+    .build();
+
+WebClient.builder()
+    .clientConnector(new ReactorClientHttpConnector(HttpClient.create(provider)))
+    .build();
+```
+
+`pendingAcquireTimeout` means requests waiting for a connection fail fast with a clear error rather than queuing indefinitely. Clients get a 504, not a hung connection.
+
 **ContentCachingRequestWrapper**
 An `HttpServletRequest` body is an `InputStream` — it can only be read once. Without wrapping, the first filter to read the body (e.g. a logging filter) leaves an empty stream for everything downstream. `ContentCachingRequestWrapper` reads and buffers the body in memory on first access. Subsequent reads get the buffered copy.
 
 **Hard timeouts — non-negotiable**
-`connectTimeout=2000ms` — if TCP handshake to the target takes more than 2 seconds, something is wrong. `readTimeout=5000ms` — if the target doesn't respond within 5 seconds, return 504. Without these, one slow or hung target service blocks a WebClient thread indefinitely. Even async threads have limits.
+`connectTimeout=2000ms` — if TCP handshake to the target takes more than 2 seconds, something is wrong. `readTimeout=5000ms` — if the target doesn't respond within 5 seconds, return 504. Without these, one slow or hung target service blocks a WebClient thread indefinitely.
 
 **OncePerRequestFilter**
 Spring can invoke filters multiple times in an error dispatch cycle. `OncePerRequestFilter` guarantees the proxy logic runs exactly once per HTTP request regardless of how Spring internally re-dispatches.
@@ -178,6 +219,17 @@ Every proxied request is published as a `RequestEvent` to Kafka. Completely asyn
 **Fire-and-forget — no .get()**
 `kafkaTemplate.send(topic, event)` returns a `CompletableFuture`. Calling `.get()` blocks the current thread until Kafka acknowledges the write — this is synchronous Kafka, the same as not using async at all. We attach an error callback via `.whenComplete()` and return immediately. If Kafka is slow, the proxy doesn't care.
 
+**Bounded producer queue — max.block.ms**
+By default, if Kafka's internal send buffer fills up (Kafka is slow or down), the producer blocks indefinitely waiting to enqueue the next event. Under sustained load this means events pile up in memory until the JVM runs out of heap and crashes.
+
+`max.block.ms=5000` is set in the producer config:
+
+```java
+props.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 5000);
+```
+
+If the buffer is full for more than 5 seconds, the send throws a `TimeoutException` which the `.whenComplete()` error callback catches and logs. The request still completes normally for the client — one analytics event is dropped. This is the correct tradeoff: analytics loss over gateway crash.
+
 **UUID eventId for idempotency**
 Kafka guarantees at-least-once delivery — on consumer restart, it may replay events from the last committed offset. Without dedup, replaying 1000 events adds 1000 to every counter. Each `RequestEvent` gets a `UUID.randomUUID()` eventId at creation. The consumer runs `SET NX processed:{eventId} 1 EX 86400` before touching any counter. If the key exists, the event is a duplicate — skip it. This makes the consumer replay-safe.
 
@@ -208,6 +260,9 @@ Maintains real-time metrics in Redis. Protects all analytics endpoints with JWT.
 **Idempotent updates**
 The Kafka consumer deduplicates before calling `AnalyticsService`. Counter updates are only called for events that passed the SET NX check — safe to process at-least-once.
 
+**Redis down — known data integrity risk**
+If Redis is unavailable, the dedup SET NX call fails and is skipped. If Kafka later replays events, counters are incremented again — analytics are silently wrong. The gateway itself stays up (circuit breaker handles this), but data integrity is not guaranteed during a Redis outage. Acceptable for this scale; a more robust solution would persist dedup state to Supabase as a fallback.
+
 ### JWT security decisions
 
 **Why JWT over API key**
@@ -225,8 +280,8 @@ API keys don't expire, can't be selectively revoked without a database lookup, a
 **No RBAC**
 Every authenticated developer has identical analytics access. There is no partial access use case — you're either a trusted developer with an account or you're not. RBAC would add complexity (role column, role checks, role assignment logic) with zero practical benefit. If a multi-tenant use case emerges, add a `role` column to Supabase and a `hasRole()` check in `SecurityConfig` — the rest of the layer stays identical.
 
-**HTTPS gap — known, documented**
-JWT is transmitted in the `Authorization` header. Over plain HTTP, it's interceptable on the local network. In production, API Guardian runs behind a reverse proxy (Nginx, Cloudflare) that terminates TLS. Locally, the risk is accepted as a dev convenience. Document it, don't ignore it.
+**HTTPS**
+TLS is terminated by Railway (production) and Vercel (dashboard). JWT tokens in `Authorization` headers are always encrypted in transit. No additional configuration required.
 
 ### Files
 - `security/SecurityConfig.java`
@@ -254,11 +309,44 @@ WebSocket is bidirectional — overkill for a dashboard that only receives data.
 **CopyOnWriteArrayList for emitter registry**
 Multiple Kafka consumer threads push to the emitter list concurrently. `CopyOnWriteArrayList` is thread-safe for iteration — no `ConcurrentModificationException`. Write operations (add/remove) are slower but rare compared to reads.
 
-**Dead emitter cleanup — non-negotiable**
-When a browser tab closes, its `SseEmitter` throws `IOException` on the next send attempt. Without cleanup, dead emitters accumulate indefinitely — memory leak under sustained use. The push loop catches `IOException`, calls `emitter.complete()`, and removes it from the list immediately.
+**Connection cap — 100 max**
+Without a cap, an unbounded number of browser tabs (or a bug) can register emitters. Each emitter holds memory. The list is checked on every new connection:
+
+```java
+if (emitters.size() >= 100) {
+    emitter.complete();
+    return emitter;
+}
+```
+
+New connections beyond 100 are immediately completed (closed) rather than queued. The dashboard auto-reconnects — it will get a slot when an existing connection drops.
+
+**Dead emitter cleanup — two mechanisms**
+Dead emitters are removed in two ways, not one:
+
+1. **On send** — when a Kafka batch triggers a push, any emitter that throws `IOException` is removed immediately. This is the primary cleanup path.
+
+2. **Periodic sweep** — a `@Scheduled` task runs every 30 seconds and calls `emitter.complete()` on any emitter that has exceeded its timeout. This handles the case where Kafka is quiet and no push has occurred recently.
+
+Without the periodic sweep, dead emitters from quiet periods accumulate until the next Kafka event — a slow memory leak under low traffic.
+
+```java
+@Scheduled(fixedDelay = 30000)
+public void cleanDeadEmitters() {
+    emitters.removeIf(emitter -> {
+        try {
+            emitter.send(SseEmitter.event().comment("ping"));
+            return false;
+        } catch (IOException e) {
+            emitter.complete();
+            return true;
+        }
+    });
+}
+```
 
 **Push on Kafka batch, not on timer**
-Updates are event-driven — the dashboard updates exactly when new data arrives. A timer would push stale data on quiet periods and might lag behind on busy ones.
+Analytics updates are event-driven — the dashboard updates exactly when new data arrives. A timer would push stale data on quiet periods and might lag behind on busy ones.
 
 ### Files
 - `analytics/AnalyticsStreamController.java`
@@ -336,10 +424,10 @@ Supabase free tier allows 60 direct connections. We configure HikariCP with `max
 | # | Fault | Severity | Fix |
 |---|---|---|---|
 | 1 | JWT revocation gap — deleted accounts valid for 24h | HIGH | Redis blacklist on `jti` claim, TTL = remaining token lifetime |
-| 2 | No HTTPS | HIGH | Documented as known gap — TLS termination at reverse proxy in prod |
+| 2 | No HTTPS | HIGH | TLS terminated by Railway (gateway) and Vercel (dashboard) automatically |
 | 3 | No HikariCP config — Supabase starved at 10 connections | HIGH | Explicit pool: max 20, min idle 5, 30s timeout |
 | 4 | bcrypt rounds set externally | HIGH | `PasswordEncoder` bean, strength 12, all hashing in code |
-| 5 | SSE emitter list unbounded — memory leak | MEDIUM | `CopyOnWriteArrayList`, remove dead emitters on `IOException` |
+| 5 | SSE emitter list unbounded — memory leak | HIGH | 100 connection cap + periodic cleanup sweep every 30s |
 | 6 | No health endpoint | LOW | Spring Actuator `/actuator/health` |
 | 7 | RestTemplate blocking proxy | HIGH | WebClient non-blocking I/O |
 | 8 | Kafka `.get()` on hot path | HIGH | Fire-and-forget with error callback |
@@ -350,6 +438,9 @@ Supabase free tier allows 60 direct connections. We configure HikariCP with `max
 | 13 | Idempotent consumer missing | MEDIUM | Redis SET NX on UUID eventId |
 | 14 | S3 export no retry or DLQ | MEDIUM | Spring Retry 3 attempts + Kafka DLQ |
 | 15 | SSE polling | LOW | SseEmitter push on Kafka batch |
+| 16 | Kafka producer unbounded queue — OOM crash | HIGH | `max.block.ms=5000`, drop event on timeout, log error |
+| 17 | WebClient connection pool unbounded | MEDIUM | Explicit pool: max 500 connections, 10s acquire timeout |
+| 18 | SSE dead emitter cleanup relies on Kafka activity | MEDIUM | `@Scheduled` ping sweep every 30s as secondary cleanup |
 
 ---
 
@@ -371,7 +462,7 @@ Change `proxy.target.url` in `application.properties`. The entire proxy layer is
 4. Add `.hasRole("ADMIN")` to relevant routes in `SecurityConfig`
 
 ### Scale horizontally
-Rate limiting and analytics already work across multiple instances — both use Redis as shared state. Kafka consumer group ensures each event is processed once across all instances. Supabase handles concurrent connections via HikariCP pool. S3 export should be moved to a separate scheduled job to avoid duplicate exports.
+Rate limiting and analytics already work across multiple instances — both use Redis as shared state. Kafka consumer group ensures each event is processed once across all instances. Supabase handles concurrent connections via HikariCP pool. S3 export should be moved to a separate scheduled job to avoid duplicate exports. Railway supports horizontal scaling via service replicas.
 
 ---
 
@@ -388,4 +479,4 @@ PERSISTENT → Supabase   developer accounts, bcrypt hashes                     
 
 ## Interview One-liner
 
-> "Event-driven architecture — the proxy emits request events to Kafka and downstream consumers react independently. Write and read paths are fully decoupled. JWT auth with a Redis blacklist handles immediate token revocation. Redis and S3 are wrapped in Resilience4j circuit breakers — the gateway degrades gracefully under dependency failures rather than cascading. 15 production faults identified and fixed before writing a line of feature code."
+> "Event-driven architecture — the proxy emits every request as a Kafka event, consumers process analytics independently, the gateway never blocks on observability."
